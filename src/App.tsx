@@ -7,6 +7,7 @@ import type {
 import { WORKER_THRESHOLD } from './types';
 import { getTemplateConfig } from './utils/templateConfig';
 import { CsvUploader } from './components/CsvUploader';
+import { MockDataLoader } from './components/MockDataLoader';
 import { TemplateSelector } from './components/TemplateSelector';
 import { PreviewPanel } from './components/PreviewPanel';
 import { ProgressBar } from './components/ProgressBar';
@@ -254,7 +255,9 @@ const App: React.FC = () => {
         <section className="left-panel">
           <div className="panel-section">
             <h3>📁 数据导入</h3>
-            <CsvUploader onRecordsLoaded={handleRecordsLoaded} />
+            <CsvUploader onRecordsLoaded={(records) => handleRecordsLoaded(records)} />
+            <div className="divider-line"><span>或</span></div>
+            <MockDataLoader onRecordsLoaded={handleRecordsLoaded} />
           </div>
 
           <div className="panel-section">

@@ -1,6 +1,6 @@
 import CryptoJS from 'crypto-js';
 
-const MASTER_PASSWORD_HASH = 'b7a6a2862f3d0255b6e8f9a6d63d8e2b1e2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d';
+const MASTER_PASSWORD_HASH = '240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9';
 
 export function maskAddress(address: string): string {
   if (!address) return '';
@@ -16,4 +16,4 @@ export function verifyMasterPassword(password: string): boolean {
   return hash === MASTER_PASSWORD_HASH;
 }
 
-export const MASTER_PASSWORD_HINT = '主管口令：请联系管理员获取';
+export const MASTER_PASSWORD_HINT = '默认测试口令：admin123（部署前请修改）';
