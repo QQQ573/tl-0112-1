@@ -1,9 +1,10 @@
-import type { StudentRecord, TemplateOrientation, ProcessResult, FailReason } from '../types';
-import { validateStudentRecord } from '../utils/csvParser';
-import { getTemplateConfig } from '../utils/templateConfig';
-import { getTemplateById } from '../data/templates';
-
-const MAX_RETRIES = 3;
+import type {
+  StudentRecord,
+  TemplateOrientation,
+  ProcessResult,
+  WorkerIncomingMessage,
+} from '../types';
+import { isRecoverable, MAX_RETRIES, RETRY_BASE_DELAY } from '../types';
 
 let canvas: HTMLCanvasElement | null = null;
 
@@ -14,142 +15,133 @@ function getCanvas(): HTMLCanvasElement {
   return canvas;
 }
 
-async function processSingleRecord(
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function processOne(
   record: StudentRecord,
   index: number,
   orientation: TemplateOrientation,
+  retryCount: number,
   proxyUrl?: string
 ): Promise<ProcessResult> {
-  const validation = validateStudentRecord(record);
-  if (!validation.valid) {
-    return {
-      index,
-      record,
-      success: false,
-      failReason: validation.failReason as FailReason,
-      failMessage: validation.failMessage,
-      retryCount: 0,
-    };
-  }
-
-  if (!getTemplateById(record.templateId)) {
-    return {
-      index,
-      record,
-      success: false,
-      failReason: 'template_not_found',
-      failMessage: `模板ID不存在: ${record.templateId}`,
-      retryCount: 0,
-    };
-  }
-
   try {
-    const canvasEl = getCanvas();
-    const templateConfig = getTemplateConfig(orientation);
-    const { renderStudentCard } = await import('../utils/canvasRenderer');
-    await renderStudentCard(canvasEl, { record, templateConfig, proxyUrl });
-    const dataUrl = canvasEl.toDataURL('image/jpeg', 0.9);
-
-    return {
-      index,
-      record,
-      success: true,
-      dataUrl,
-      retryCount: 0,
-    };
+    const { processSingle } = await import('../utils/retryService');
+    return processSingle(getCanvas(), record, index, orientation, retryCount, proxyUrl);
   } catch (e: any) {
-    let failReason: FailReason = 'unknown';
-    let failMessage = e?.message || '未知错误';
-
-    if (e?.message?.includes('CORS') || e?.type === 'cors') {
-      failReason = 'cors';
-      failMessage = '图片跨域加载失败';
-    } else if (e?.type === 'image_load' || e?.message?.includes('load')) {
-      failReason = 'image_load_failed';
-      failMessage = '图片加载失败';
-    }
-
     return {
       index,
       record,
       success: false,
-      failReason,
-      failMessage,
-      retryCount: 0,
+      failReason: 'unknown',
+      failMessage: e?.message || 'Worker 处理异常',
+      retryCount,
     };
   }
 }
 
-async function processWithRetry(
+async function runBatch(
   records: StudentRecord[],
   orientation: TemplateOrientation,
-  proxyUrl?: string,
-  onProgress?: (completed: number, total: number, result: ProcessResult) => void
-): Promise<ProcessResult[]> {
-  const results: ProcessResult[] = new Array(records.length);
-  const failedQueue: { index: number; retryCount: number }[] = [];
+  proxyUrl?: string
+) {
+  const total = records.length;
+  const results: ProcessResult[] = new Array(total);
 
-  for (let i = 0; i < records.length; i++) {
-    const result = await processSingleRecord(records[i], i, orientation, proxyUrl);
-    results[i] = result;
+  for (let i = 0; i < total; i++) {
+    let lastResult: ProcessResult | null = null;
+    let attempt = 0;
 
-    if (!result.success && (result.failReason === 'cors' || result.failReason === 'image_load_failed')) {
-      failedQueue.push({ index: i, retryCount: 0 });
+    while (attempt < MAX_RETRIES) {
+      const result = await processOne(records[i], i, orientation, attempt, proxyUrl);
+      lastResult = result;
+
+      if (result.success) break;
+      if (!isRecoverable(result.failReason)) break;
+
+      attempt++;
+      if (attempt < MAX_RETRIES) {
+        await sleep(RETRY_BASE_DELAY * attempt);
+      }
     }
 
-    if (onProgress) {
-      onProgress(i + 1, records.length, result);
+    if (lastResult) {
+      results[i] = lastResult;
+      self.postMessage({
+        type: 'progress',
+        completed: i + 1,
+        total,
+        result: lastResult,
+      });
     }
   }
 
-  for (const failed of failedQueue) {
-    for (let retry = 1; retry <= MAX_RETRIES; retry++) {
-      const result = await processSingleRecord(records[failed.index], failed.index, orientation, proxyUrl);
-      result.retryCount = retry;
-      results[failed.index] = result;
-
-      if (result.success) {
-        if (onProgress) {
-          onProgress(records.length + retry, records.length + MAX_RETRIES, result);
-        }
-        break;
-      }
-
-      if (onProgress) {
-        onProgress(records.length + retry, records.length + MAX_RETRIES, result);
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 500 * retry));
-    }
-  }
-
-  return results;
+  self.postMessage({
+    type: 'complete',
+    results,
+    total,
+    completed: total,
+  });
 }
 
-self.onmessage = async function (e: MessageEvent) {
-  const { records, orientation, proxyUrl } = e.data;
+async function runPartialRetry(
+  records: StudentRecord[],
+  indices: number[],
+  orientation: TemplateOrientation,
+  proxyUrl?: string
+) {
+  const total = indices.length;
+  let completed = 0;
+
+  for (let i = 0; i < indices.length; i++) {
+    const index = indices[i];
+    const record = records[index];
+    let lastResult: ProcessResult | null = null;
+    let attempt = 0;
+
+    while (attempt < MAX_RETRIES) {
+      const result = await processOne(record, index, orientation, attempt + 1, proxyUrl);
+      lastResult = result;
+
+      if (result.success) break;
+      if (!isRecoverable(result.failReason)) break;
+
+      attempt++;
+      if (attempt < MAX_RETRIES) {
+        await sleep(RETRY_BASE_DELAY * attempt);
+      }
+    }
+
+    if (lastResult) {
+      completed++;
+      self.postMessage({
+        type: 'retry',
+        index,
+        result: lastResult,
+        completed,
+        total,
+      });
+    }
+  }
+
+  self.postMessage({
+    type: 'complete',
+    isRetry: true,
+    total,
+    completed,
+  });
+}
+
+self.onmessage = async function (e: MessageEvent<WorkerIncomingMessage>) {
+  const data = e.data;
 
   try {
-    const results = await processWithRetry(
-      records,
-      orientation,
-      proxyUrl,
-      (completed, total, result) => {
-        self.postMessage({
-          type: 'progress',
-          completed,
-          total,
-          result,
-        });
-      }
-    );
-
-    self.postMessage({
-      type: 'complete',
-      results,
-      total: records.length,
-      completed: records.length,
-    });
+    if (data.type === 'partialRetry') {
+      await runPartialRetry(data.records, data.indices, data.orientation, data.proxyUrl);
+    } else {
+      await runBatch(data.records, data.orientation, data.proxyUrl);
+    }
   } catch (error: any) {
     self.postMessage({
       type: 'error',

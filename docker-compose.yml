@@ -9,6 +9,8 @@ services:
       - "3000:80"
     depends_on:
       - image-proxy
+    environment:
+      VITE_PROXY_URL: http://localhost:3001/proxy
     restart: unless-stopped
 
   image-proxy:
@@ -16,7 +18,7 @@ services:
       context: ./proxy
       dockerfile: Dockerfile
     ports:
-      - "8080:8080"
+      - "3001:8080"
     environment:
       - NODE_ENV=production
       - PORT=8080

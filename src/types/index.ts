@@ -60,7 +60,18 @@ export interface TemplateConfig {
   };
 }
 
-export type FailReason = 'cors' | 'score_out_of_range' | 'template_not_found' | 'image_load_failed' | 'unknown';
+export type FailReason =
+  | 'cors'
+  | 'score_out_of_range'
+  | 'template_not_found'
+  | 'image_load_failed'
+  | 'unknown';
+
+export const RECOVERABLE_REASONS: FailReason[] = ['cors', 'image_load_failed'];
+
+export function isRecoverable(reason?: FailReason): boolean {
+  return !!reason && RECOVERABLE_REASONS.includes(reason);
+}
 
 export interface ProcessResult {
   index: number;
@@ -81,7 +92,44 @@ export interface WorkerProgress {
   completed?: number;
 }
 
+export interface WorkerPartialRetryMsg {
+  type: 'partialRetry';
+  records: StudentRecord[];
+  indices: number[];
+  orientation: TemplateOrientation;
+  proxyUrl?: string;
+}
+
+export interface WorkerBatchMsg {
+  type?: undefined;
+  records: StudentRecord[];
+  orientation: TemplateOrientation;
+  proxyUrl?: string;
+}
+
+export type WorkerIncomingMessage = WorkerBatchMsg | WorkerPartialRetryMsg;
+
+export interface ProxyConfig {
+  enabled: boolean;
+  url: string;
+}
+
+export interface RetryProgress {
+  total: number;
+  completed: number;
+  currentIndex?: number;
+}
+
+export interface FailSummary {
+  recoverable: number;
+  unrecoverable: number;
+  byReason: Record<FailReason, number>;
+}
+
 export const SCORE_MIN = 0;
 export const SCORE_MAX = 100;
 
 export const WORKER_THRESHOLD = 70;
+
+export const MAX_RETRIES = 3;
+export const RETRY_BASE_DELAY = 500;

@@ -1,8 +1,10 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import type {
   StudentRecord,
   TemplateOrientation,
   ProcessResult,
+  ProxyConfig,
+  RetryProgress,
 } from './types';
 import { WORKER_THRESHOLD } from './types';
 import { getTemplateConfig } from './utils/templateConfig';
@@ -12,14 +14,18 @@ import { TemplateSelector } from './components/TemplateSelector';
 import { PreviewPanel } from './components/PreviewPanel';
 import { ProgressBar } from './components/ProgressBar';
 import { FailList } from './components/FailList';
+import { FailSummary } from './components/FailSummary';
 import { PasswordModal } from './components/PasswordModal';
 import { StudentList } from './components/StudentList';
+import { ProxySettings } from './components/ProxySettings';
 import { generatePdf, downloadPdf } from './utils/pdfGenerator';
-import { renderStudentCard } from './utils/canvasRenderer';
-import { validateStudentRecord } from './utils/csvParser';
-import { getTemplateById } from './data/templates';
+import { retryIndices, getRetryableIndices } from './utils/retryService';
+import { exportFailReportCsv } from './utils/failReport';
 
 import './App.css';
+
+const DEFAULT_PROXY_URL =
+  (import.meta.env.VITE_PROXY_URL as string) || 'http://localhost:3001/proxy';
 
 const App: React.FC = () => {
   const [records, setRecords] = useState<StudentRecord[]>([]);
@@ -36,10 +42,20 @@ const App: React.FC = () => {
   const [exportTotal, setExportTotal] = useState(0);
   const [isExporting, setIsExporting] = useState(false);
 
+  const [proxyConfig, setProxyConfig] = useState<ProxyConfig>({
+    enabled: false,
+    url: DEFAULT_PROXY_URL,
+  });
+
+  const [isRetrying, setIsRetrying] = useState(false);
+  const [retryProgress, setRetryProgress] = useState<RetryProgress>({ total: 0, completed: 0 });
+  const [retryingIndices, setRetryingIndices] = useState<Set<number>>(new Set());
+
   const workerRef = useRef<Worker | null>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const templateConfig = getTemplateConfig(orientation);
+  const activeProxyUrl = proxyConfig.enabled ? proxyConfig.url : undefined;
 
   const handleRecordsLoaded = useCallback((loadedRecords: StudentRecord[]) => {
     setRecords(loadedRecords);
@@ -56,83 +72,24 @@ const App: React.FC = () => {
     setTotal(0);
   }, []);
 
-  const processAllSync = useCallback(
-    async (recordsToProcess: StudentRecord[]): Promise<ProcessResult[]> => {
-      const canvas = document.createElement('canvas');
-      const newResults: ProcessResult[] = [];
+  const getOrCreateWorker = useCallback(() => {
+    if (workerRef.current) return workerRef.current;
+    const worker = new Worker(new URL('./workers/batchWorker.ts', import.meta.url), {
+      type: 'module',
+    });
+    workerRef.current = worker;
+    return worker;
+  }, []);
 
-      for (let i = 0; i < recordsToProcess.length; i++) {
-        const record = recordsToProcess[i];
-
-        const validation = validateStudentRecord(record);
-        if (!validation.valid) {
-          newResults.push({
-            index: i,
-            record,
-            success: false,
-            failReason: validation.failReason as any,
-            failMessage: validation.failMessage,
-            retryCount: 0,
-          });
-          setProgress(i + 1);
-          continue;
-        }
-
-        if (!getTemplateById(record.templateId)) {
-          newResults.push({
-            index: i,
-            record,
-            success: false,
-            failReason: 'template_not_found',
-            failMessage: `模板ID不存在: ${record.templateId}`,
-            retryCount: 0,
-          });
-          setProgress(i + 1);
-          continue;
-        }
-
-        try {
-          await renderStudentCard(canvas, { record, templateConfig });
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
-          newResults.push({
-            index: i,
-            record,
-            success: true,
-            dataUrl,
-            retryCount: 0,
-          });
-        } catch (e: any) {
-          let failReason: any = 'unknown';
-          let failMessage = e?.message || '未知错误';
-
-          if (e?.message?.includes('CORS') || e?.message?.includes('cross')) {
-            failReason = 'cors';
-            failMessage = '图片跨域加载失败';
-          } else if (e?.message?.includes('load') || e?.message?.includes('image')) {
-            failReason = 'image_load_failed';
-            failMessage = '图片加载失败';
-          }
-
-          newResults.push({
-            index: i,
-            record,
-            success: false,
-            failReason,
-            failMessage,
-            retryCount: 0,
-          });
-        }
-
-        setProgress(i + 1);
-      }
-
-      return newResults;
-    },
-    [templateConfig]
-  );
+  const terminateWorker = useCallback(() => {
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
+    }
+  }, []);
 
   const handleStartProcessing = useCallback(async () => {
-    if (records.length === 0) return;
+    if (records.length === 0 || isProcessing) return;
 
     setIsProcessing(true);
     setProgress(0);
@@ -143,50 +100,55 @@ const App: React.FC = () => {
     setUseWorker(shouldUseWorker);
 
     if (shouldUseWorker) {
-      if (workerRef.current) {
-        workerRef.current.terminate();
-      }
-
-      const worker = new Worker(new URL('./workers/batchWorker.ts', import.meta.url), {
-        type: 'module',
-      });
-
-      workerRef.current = worker;
+      terminateWorker();
+      const worker = getOrCreateWorker();
 
       worker.onmessage = (e: MessageEvent) => {
         const data = e.data;
-
         if (data.type === 'progress') {
           setProgress(data.completed);
           setTotal(data.total);
           if (data.result) {
             setResults((prev) => {
-              const newResults = [...prev];
-              newResults[data.result.index] = data.result;
-              return newResults;
+              const next = [...prev];
+              next[data.result.index] = data.result;
+              return next;
             });
           }
-        } else if (data.type === 'complete') {
-          setResults(data.results);
+        } else if (data.type === 'complete' && !data.isRetry) {
+          if (data.results) setResults(data.results);
           setIsProcessing(false);
-          worker.terminate();
-          workerRef.current = null;
+          terminateWorker();
         } else if (data.type === 'error') {
           console.error('Worker error:', data.message);
           setIsProcessing(false);
-          worker.terminate();
-          workerRef.current = null;
+          terminateWorker();
         }
       };
 
       worker.postMessage({
         records,
         orientation,
-        proxyUrl: undefined,
+        proxyUrl: activeProxyUrl,
       });
     } else {
       try {
-        const newResults = await processAllSync(records);
+        const newResults = await retryIndices(
+          records,
+          records.map((_, i) => i),
+          [],
+          orientation,
+          activeProxyUrl,
+          (prog, latest) => {
+            setProgress(prog.completed);
+            setTotal(prog.total);
+            setResults((prev) => {
+              const next = [...prev];
+              next[latest.index] = latest;
+              return next;
+            });
+          }
+        );
         setResults(newResults);
       } catch (e) {
         console.error('Processing error:', e);
@@ -194,10 +156,110 @@ const App: React.FC = () => {
         setIsProcessing(false);
       }
     }
-  }, [records, orientation, processAllSync]);
+  }, [records, orientation, activeProxyUrl, isProcessing, getOrCreateWorker, terminateWorker]);
+
+  const doRetryByWorker = useCallback(
+    (indices: number[]) => {
+      const worker = getOrCreateWorker();
+      setRetryingIndices(new Set(indices));
+      setRetryProgress({ total: indices.length, completed: 0 });
+
+      worker.onmessage = (e: MessageEvent) => {
+        const data = e.data;
+
+        if (data.type === 'retry') {
+          setRetryProgress({
+            total: data.total,
+            completed: data.completed,
+            currentIndex: data.index,
+          });
+          if (data.result) {
+            setResults((prev) => {
+              const next = [...prev];
+              next[data.result.index] = data.result;
+              return next;
+            });
+          }
+        } else if (data.type === 'complete') {
+          if (data.isRetry) {
+            setIsRetrying(false);
+            setRetryingIndices(new Set());
+          }
+        } else if (data.type === 'error') {
+          console.error('Worker retry error:', data.message);
+          setIsRetrying(false);
+          setRetryingIndices(new Set());
+        }
+      };
+
+      worker.postMessage({
+        type: 'partialRetry',
+        records,
+        indices,
+        orientation,
+        proxyUrl: activeProxyUrl,
+      } as any);
+    },
+    [records, orientation, activeProxyUrl, getOrCreateWorker]
+  );
+
+  const handleRetryIndices = useCallback(
+    async (indices: number[]) => {
+      if (indices.length === 0 || isRetrying || isProcessing) return;
+
+      setIsRetrying(true);
+      setRetryProgress({ total: indices.length, completed: 0 });
+
+      const shouldUseWorker = records.length > WORKER_THRESHOLD;
+
+      if (shouldUseWorker) {
+        doRetryByWorker(indices);
+        return;
+      }
+
+      try {
+        setRetryingIndices(new Set(indices));
+        await retryIndices(
+          records,
+          indices,
+          results,
+          orientation,
+          activeProxyUrl,
+          (prog, latest) => {
+            setRetryProgress(prog);
+            setResults((prev) => {
+              const next = [...prev];
+              next[latest.index] = latest;
+              return next;
+            });
+          }
+        );
+      } catch (e) {
+        console.error('Retry error:', e);
+      } finally {
+        setIsRetrying(false);
+        setRetryingIndices(new Set());
+      }
+    },
+    [records, results, orientation, activeProxyUrl, isRetrying, isProcessing, doRetryByWorker]
+  );
+
+  const handleRetrySingle = useCallback(
+    (index: number) => {
+      handleRetryIndices([index]);
+    },
+    [handleRetryIndices]
+  );
+
+  const handleRetryAllRecoverable = useCallback(() => {
+    const indices = getRetryableIndices(results);
+    if (indices.length > 0) {
+      handleRetryIndices(indices);
+    }
+  }, [results, handleRetryIndices]);
 
   const handleExportPdf = useCallback(async () => {
-    const successResults = results.filter((r) => r.success);
+    const successResults = results.filter((r) => r && r.success);
     if (successResults.length === 0) {
       alert('没有可导出的成功项');
       return;
@@ -208,9 +270,9 @@ const App: React.FC = () => {
     setExportTotal(successResults.length);
 
     try {
-      const blob = await generatePdf(results, orientation, (current, total) => {
+      const blob = await generatePdf(results, orientation, (current, tot) => {
         setExportProgress(current);
-        setExportTotal(total);
+        setExportTotal(tot);
       });
       downloadPdf(blob, '暑期成长评语单.pdf');
     } catch (e) {
@@ -221,28 +283,25 @@ const App: React.FC = () => {
     }
   }, [results, orientation]);
 
-  const handleRetryFailed = useCallback(
-    (indices: number[]) => {
-      if (indices.length === 0) return;
-      alert(`准备重试 ${indices.length} 个失败项，请重新点击生成按钮`);
-    },
-    []
-  );
-
   const handlePasswordSuccess = useCallback(() => {
     setShowAddress(true);
   }, []);
 
   useEffect(() => {
     return () => {
-      if (workerRef.current) {
-        workerRef.current.terminate();
-      }
+      terminateWorker();
     };
-  }, []);
+  }, [terminateWorker]);
 
-  const successCount = results.filter((r) => r.success).length;
-  const failCount = results.filter((r) => !r.success && r !== undefined).length;
+  const successCount = useMemo(
+    () => results.filter((r) => r && r.success).length,
+    [results]
+  );
+  const failCount = useMemo(
+    () => results.filter((r) => r && !r.success).length,
+    [results]
+  );
+  const hasAnyFail = failCount > 0;
 
   return (
     <div className="app">
@@ -255,9 +314,15 @@ const App: React.FC = () => {
         <section className="left-panel">
           <div className="panel-section">
             <h3>📁 数据导入</h3>
-            <CsvUploader onRecordsLoaded={(records) => handleRecordsLoaded(records)} />
-            <div className="divider-line"><span>或</span></div>
+            <CsvUploader onRecordsLoaded={(rs) => handleRecordsLoaded(rs)} />
+            <div className="divider-line">
+              <span>或</span>
+            </div>
             <MockDataLoader onRecordsLoaded={handleRecordsLoaded} />
+          </div>
+
+          <div className="panel-section">
+            <ProxySettings config={proxyConfig} onChange={setProxyConfig} />
           </div>
 
           <div className="panel-section">
@@ -287,7 +352,11 @@ const App: React.FC = () => {
             </div>
             {records.length > 0 && (
               <p className="hint-text">
-                共 {records.length} 条记录，{records.length > WORKER_THRESHOLD ? '将使用 Web Worker 批量处理' : '将使用主线程处理'}
+                共 {records.length} 条记录，
+                {records.length > WORKER_THRESHOLD
+                  ? '将使用 Web Worker 批量处理'
+                  : '将使用主线程处理'}
+                {proxyConfig.enabled && ' · 已启用图片代理'}
               </p>
             )}
           </div>
@@ -303,7 +372,11 @@ const App: React.FC = () => {
           {isExporting && (
             <div className="panel-section">
               <h3>📦 PDF 导出</h3>
-              <ProgressBar progress={exportProgress} total={exportTotal} label="导出进度" />
+              <ProgressBar
+                progress={exportProgress}
+                total={exportTotal}
+                label="导出进度"
+              />
             </div>
           )}
 
@@ -337,7 +410,23 @@ const App: React.FC = () => {
             </div>
           )}
 
-          <FailList results={results} onRetry={handleRetryFailed} />
+          {hasAnyFail && (
+            <div className="panel-section fail-panel">
+              <FailSummary
+                results={results}
+                onRetryAll={handleRetryAllRecoverable}
+                onExportReport={() => exportFailReportCsv(results)}
+                isRetrying={isRetrying}
+                retryProgress={retryProgress}
+              />
+              <FailList
+                results={results}
+                onRetrySingle={handleRetrySingle}
+                isRetrying={isRetrying}
+                retryingIndices={retryingIndices}
+              />
+            </div>
+          )}
         </section>
 
         <section className="right-panel">
@@ -354,6 +443,7 @@ const App: React.FC = () => {
           <PreviewPanel
             record={records[selectedIndex] || null}
             templateConfig={templateConfig}
+            proxyUrl={activeProxyUrl}
           />
         </section>
       </main>
