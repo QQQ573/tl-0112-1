@@ -1,0 +1,11 @@
+学员ID,姓名,班级,学习能力,纪律性,合作能力,创造力,体能,头像URL,寄语模板ID,家庭住址
+S001,张三,一年级一班,85,90,78,92,88,https://picsum.photos/seed/student001/200/200,tpl_001,北京市朝阳区建国路88号
+S002,李四,一年级一班,76,82,90,85,79,https://picsum.photos/seed/student002/200/200,tpl_002,上海市浦东新区陆家嘴环路1000号
+S003,王五,一年级二班,92,88,85,78,91,https://picsum.photos/seed/student003/200/200,tpl_003,广州市天河区天河路385号
+S004,赵六,一年级二班,68,75,82,95,72,https://picsum.photos/seed/student004/200/200,tpl_001,深圳市南山区科技园路1号
+S005,孙七,一年级一班,88,92,79,80,85,https://picsum.photos/seed/student005/200/200,tpl_004,杭州市西湖区文三路259号
+S006,周八,二年级一班,79,80,88,76,90,https://picsum.photos/seed/student006/200/200,tpl_002,成都市锦江区春熙路1号
+S007,吴九,二年级一班,95,85,82,90,87,https://picsum.photos/seed/student007/200/200,tpl_005,武汉市洪山区珞喻路1037号
+S008,郑十,二年级二班,72,69,75,88,80,https://picsum.photos/seed/student008/200/200,tpl_001,西安市碑林区长安北路1号
+S009,钱十一,二年级二班,83,87,90,75,76,https://picsum.photos/seed/student009/200/200,tpl_003,南京市鼓楼区中山路321号
+S010,陈十二,三年级一班,90,83,77,92,82,https://picsum.photos/seed/student010/200/200,tpl_004,重庆市渝中区解放碑1号
